@@ -1,0 +1,6 @@
+{
+  "teamTarget": "#demo-team",
+  "summary": "- (Demo fallback) Vision model failed or timed out.\n- Error: Ollama chat failed: 400 {\"error\":\"json: cannot unmarshal array into Go struct field ChatRequest.messages.content of type string\"}\n- Action item: Verify Ollama is running and the model is pulled, then retry.",
+  "imageUrl": "http://localhost:8080/uploads/KZRMDvBgrKu43nRBCzwS_.png",
+  "createdAt": "2026-02-06T22:24:07.585Z"
+}

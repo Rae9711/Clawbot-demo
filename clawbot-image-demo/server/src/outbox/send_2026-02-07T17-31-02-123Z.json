@@ -1,0 +1,6 @@
+{
+  "teamTarget": "#demo-team",
+  "prompt": "We want to build a lightweight agent framework where LLMs propose plans but never execute tools directly.",
+  "summary": "The LLMs will propose plans but not execute tools directly. This framework will be lightweight and designed to facilitate the interaction between LLMs and the agent. The next step is to define the architecture and the communication protocol between the LLMs and the agent.",
+  "createdAt": "2026-02-07T17:31:02.169Z"
+}
