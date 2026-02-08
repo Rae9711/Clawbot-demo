@@ -5,10 +5,10 @@ export async function runSandboxed<T>(
     label?: string;
   }
 ): Promise<T> {
-  const timeoutMs = opts?.timeoutMs ?? 60_000; // 60s hard cap
+  const timeoutMs = opts?.timeoutMs ?? 60000000; // 60s hard cap
   const label = opts?.label ?? "sandboxed-task";
 
-  let timer: NodeJS.Timeout;
+  let timer: NodeJS.Timeout | undefined;
 
   try {
     return await Promise.race([

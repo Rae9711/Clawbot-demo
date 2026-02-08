@@ -1,52 +1,59 @@
+/**
+ * Plan generation — Call A (Planner).
+ *
+ * ONE job: produce a strict JSON plan with concrete tool calls + arguments.
+ * The plan lists every tool by ID from the registry, with args and dependencies.
+ * Execution follows this plan step-by-step.
+ */
+
 import { nanoid } from "nanoid";
 import { savePlan } from "../planStore.js";
 import { textComplete } from "./ollama.js";
 import { jsonrepair } from "jsonrepair";
+import { getTool, getToolCatalog, getToolIds } from "./tools/registry.js";
 
-export type AllowedTool = "llm.text" | "outbox.send";
+// ── types ────────────────────────────────────────────────
 
-export type PlanStep =
-  | {
-      id: string;
-      tool: "llm.text";
-      /** prompt template; can reference {{prompt}} and {{vars.*}} */
-      prompt: string;
-      /** store output into vars[name] */
-      saveAs: string;
-    }
-  | {
-      id: string;
-      tool: "outbox.send";
-      /** optional target */
-      teamTarget?: string;
-      /** message template; can reference {{vars.*}} and {{prompt}} */
-      message: string;
-    };
+export type PlanStep = {
+  id: string;
+  /** Tool ID from the registry (e.g. "text.generate", "platform.send") */
+  tool: string;
+  /** Chinese description of what this step does */
+  description: string;
+  /** Tool arguments — may contain {{vars.NAME}} or {{vars.NAME.field}} refs */
+  args: Record<string, any>;
+  /** Store output in vars[saveAs] for use by later steps */
+  saveAs?: string;
+  /** Step IDs this depends on (informational for the UI) */
+  dependsOn?: string[];
+};
 
 export type Plan = {
   planId: string;
   sessionId: string;
   createdAt: number;
-  persona: string;
 
-  /** user prompt captured at plan time */
+  /** Original user prompt, verbatim */
   prompt: string;
 
-  /** free-form intent label; not trusted for execution */
+  /** Free-form intent label */
   intent: string;
 
-  /** steps must be allowlisted + validated */
+  /** Concrete execution steps */
   steps: PlanStep[];
+
+  /** Union of all permissions required across all steps */
+  requiredPermissions: string[];
 };
+
+// ── JSON extraction / repair ─────────────────────────────
 
 function extractJsonObject(s: string): string {
   const t = (s ?? "").trim();
 
-  // strip ```json ... ```
   const fenced = t.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   const candidate = fenced ? fenced[1].trim() : t;
 
-  // grab first {...} block
   const start = candidate.indexOf("{");
   const end = candidate.lastIndexOf("}");
   if (start >= 0 && end > start) return candidate.slice(start, end + 1);
@@ -54,171 +61,292 @@ function extractJsonObject(s: string): string {
   return candidate;
 }
 
-function parsePlanJson(raw: string): any {
-  const candidate = extractJsonObject(raw);
-  return JSON.parse(candidate);
-}
-
-
-/** Very small templating: {{prompt}}, {{vars.foo}} */
-function renderTemplate(tpl: string, ctx: { prompt: string; vars: Record<string, string> }) {
-  return tpl
-    .replaceAll("{{prompt}}", ctx.prompt)
-    .replace(/\{\{\s*vars\.([a-zA-Z0-9_]+)\s*\}\}/g, (_m, k) => ctx.vars[k] ?? "");
-}
-
 function safeJsonParse(s: string): any {
-  const trimmed = (s ?? "").trim();
-
-  // Strip ```json fences if model ignores format=json (still happens sometimes)
-  const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  const candidate = (fence?.[1]?.trim() ?? trimmed);
-
-  // Extract first {...} block if extra text leaked
-  const start = candidate.indexOf("{");
-  const end = candidate.lastIndexOf("}");
-  const jsonish = (start >= 0 && end > start) ? candidate.slice(start, end + 1) : candidate;
-
-  // 🔥 Repair common errors: missing commas, trailing commas, quotes, etc.
-  const repaired = jsonrepair(jsonish);
-
+  const candidate = extractJsonObject(s);
+  const repaired = jsonrepair(candidate);
   return JSON.parse(repaired);
 }
 
+// ── validation ───────────────────────────────────────────
 
-function validatePlanDraft(draft: any): { intent: string; steps: PlanStep[] } {
-  if (!draft || typeof draft !== "object") throw new Error("Plan draft must be an object");
+function validatePlanDraft(draft: any): {
+  intent: string;
+  steps: PlanStep[];
+  requiredPermissions: string[];
+} {
+  if (!draft || typeof draft !== "object") {
+    throw new Error("Plan draft must be an object, got: " + JSON.stringify(draft).slice(0, 200));
+  }
+
   const intent = typeof draft.intent === "string" ? draft.intent : "unspecified";
-  const steps = draft.steps;
 
-  if (!Array.isArray(steps) || steps.length === 0) {
+  // The 1.5b model sometimes puts steps in different places — try to find them
+  let steps: any[] | undefined;
+  if (Array.isArray(draft.steps) && draft.steps.length > 0) {
+    steps = draft.steps;
+  } else if (Array.isArray(draft.plan) && draft.plan.length > 0) {
+    steps = draft.plan;
+  } else if (Array.isArray(draft.actions) && draft.actions.length > 0) {
+    steps = draft.actions;
+  } else if (Array.isArray(draft)) {
+    steps = draft;
+  } else {
+    // Last resort: look for any array property
+    for (const v of Object.values(draft)) {
+      if (Array.isArray(v) && v.length > 0 && v[0]?.tool) {
+        steps = v;
+        break;
+      }
+    }
+  }
+
+  if (!steps || steps.length === 0) {
+    console.error("[validatePlanDraft] no steps found in:", JSON.stringify(draft).slice(0, 500));
     throw new Error("Plan draft must include a non-empty steps array");
   }
 
+  const allowedToolIds = new Set(getToolIds());
+  const allPermissions = new Set<string>();
   const out: PlanStep[] = [];
 
   for (let i = 0; i < steps.length; i++) {
     const s = steps[i];
-    if (!s || typeof s !== "object") throw new Error(`Step ${i} must be an object`);
+    if (!s || typeof s !== "object") {
+      throw new Error(`Step ${i} must be an object`);
+    }
 
-    const tool = s.tool as AllowedTool;
+    const toolId = s.tool;
     const id = typeof s.id === "string" ? s.id : `s${i + 1}`;
 
-    if (tool === "llm.text") {
-      if (typeof s.prompt !== "string" || !s.prompt.trim()) {
-        throw new Error(`Step ${id}: llm.text requires non-empty prompt`);
-      }
-      if (typeof s.saveAs !== "string" || !/^[a-zA-Z0-9_]+$/.test(s.saveAs)) {
-        throw new Error(`Step ${id}: llm.text requires saveAs (alphanum/underscore)`);
-      }
-      out.push({ id, tool, prompt: s.prompt, saveAs: s.saveAs });
-      continue;
+    // Validate tool exists in registry
+    if (!allowedToolIds.has(toolId)) {
+      throw new Error(`Step ${id}: tool not in registry: ${String(toolId)}`);
     }
 
-    if (tool === "outbox.send") {
-      if (typeof s.message !== "string" || !s.message.trim()) {
-        throw new Error(`Step ${id}: outbox.send requires non-empty message`);
-      }
-      const teamTarget = typeof s.teamTarget === "string" ? s.teamTarget : undefined;
-      out.push({ id, tool, teamTarget, message: s.message });
-      continue;
+    const tool = getTool(toolId)!;
+
+    // Collect permissions
+    for (const perm of tool.permissions) {
+      allPermissions.add(perm);
     }
 
-    // Reject unknown tools
-    throw new Error(`Step ${id}: tool not allowed: ${String(s.tool)}`);
+    const description =
+      typeof s.description === "string" ? s.description : tool.name;
+    const args =
+      s.args && typeof s.args === "object" ? s.args : {};
+    // Sanitize saveAs — small models write "{{vars.foo.bar}}" instead of "foo"
+    let saveAs: string | undefined;
+    if (typeof s.saveAs === "string") {
+      saveAs = s.saveAs
+        .replace(/^\{\{\s*vars\.\s*/, "")
+        .replace(/\s*\}\}\s*$/, "")
+        .replace(/\..+$/, "");
+    }
+
+    // Auto-infer saveAs when the model forgot it but later steps reference it
+    if (!saveAs) {
+      saveAs = inferSaveAs(toolId);
+    }
+
+    const dependsOn = Array.isArray(s.dependsOn)
+      ? s.dependsOn.filter((d: any) => typeof d === "string")
+      : undefined;
+
+    out.push({ id, tool: toolId, description, args, saveAs, dependsOn });
   }
 
-  return { intent, steps: out };
+  return {
+    intent,
+    steps: out,
+    requiredPermissions: Array.from(allPermissions),
+  };
 }
 
-async function planWithRepair(args: { persona: string; plannerInstruction: string }) {
+// ── auto-infer saveAs for tools that produce data ────────
+
+const TOOL_SAVE_AS: Record<string, string> = {
+  "contacts.apple": "contact",
+  "contacts.lookup": "contact",
+  "text.generate": "msg",
+  "image.generate": "image",
+};
+
+function inferSaveAs(toolId: string): string | undefined {
+  return TOOL_SAVE_AS[toolId];
+}
+
+// ── normalize LLM output into plan shape ─────────────────
+
+/**
+ * The 1.5b model produces various JSON shapes. This normalizes them all
+ * into { intent, steps: [...] }.
+ */
+function normalizePlanDraft(parsed: any): any {
+  if (!parsed || typeof parsed !== "object") return parsed;
+
+  // Case 1: already correct { steps: [...] }
+  if (Array.isArray(parsed.steps) && parsed.steps.length > 0) {
+    return parsed;
+  }
+
+  // Case 2: single step object { tool: "...", ... }
+  if (parsed.tool && typeof parsed.tool === "string") {
+    console.log("[normalize] single step object → wrapping in steps array");
+    return {
+      intent: parsed.description ?? "unspecified",
+      steps: [{ ...parsed, id: parsed.id ?? "s1" }],
+    };
+  }
+
+  // Case 3: bare array of steps [{ tool: "..." }, ...]
+  if (Array.isArray(parsed) && parsed.length > 0 && parsed[0]?.tool) {
+    console.log("[normalize] bare array → wrapping");
+    return { intent: "unspecified", steps: parsed };
+  }
+
+  // Case 4: nested under a different key (plan, actions, tasks, etc.)
+  for (const key of ["plan", "actions", "tasks", "execution", "workflow"]) {
+    const val = parsed[key];
+    if (Array.isArray(val) && val.length > 0) {
+      console.log(`[normalize] found steps under "${key}"`);
+      return { ...parsed, steps: val };
+    }
+  }
+
+  // Case 5: any array-valued property that contains objects with "tool"
+  for (const [key, val] of Object.entries(parsed)) {
+    if (Array.isArray(val) && val.length > 0 && (val[0] as any)?.tool) {
+      console.log(`[normalize] found tool-steps under "${key}"`);
+      return { ...parsed, steps: val };
+    }
+  }
+
+  // Can't normalize — return as-is, let validatePlanDraft throw with good error
+  return parsed;
+}
+
+// ── plan generation with ONE repair attempt ──────────────
+
+async function planWithRepair(plannerInstruction: string) {
   let raw = await textComplete({
-    persona: args.persona,
-    prompt: args.plannerInstruction,
-    forceJson: true
+    prompt: plannerInstruction,
+    role: "planner",
+    forceJson: true,
   });
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      return safeJsonParse(raw);
-    } catch (e: any) {
-      const err = e?.message || String(e);
+  console.log("[planWithRepair] raw LLM output:", raw.slice(0, 800));
 
-      const repairPrompt = `
+  try {
+    const parsed = safeJsonParse(raw);
+    return normalizePlanDraft(parsed);
+  } catch (e) {
+    console.warn("[planWithRepair] parse failed:", (e as Error).message);
+  }
+
+  // Repair attempt
+  const repairPrompt = `
 Return ONLY valid JSON. No markdown. No extra text.
 
-You must follow this schema exactly:
-{"intent":"string","steps":[{"id":"s1","tool":"llm.text","prompt":"...","saveAs":"x"},{"id":"s2","tool":"outbox.send","teamTarget":"#demo-team","message":"..."}]}
-
-The previous output was invalid JSON. Fix it.
-Error: ${err}
+The previous output was invalid JSON. Fix ONLY the formatting.
+Do not change the content or meaning.
 
 Invalid output:
 ${raw}
 `.trim();
 
-      raw = await textComplete({
-        persona: args.persona,
-        prompt: repairPrompt,
-        forceJson: true
-      });
-    }
-  }
+  raw = await textComplete({
+    prompt: repairPrompt,
+    role: "planner",
+    forceJson: true,
+  });
 
-  throw new Error("Planner JSON parse failed after retries");
+  return safeJsonParse(raw);
 }
 
+// ── public API ───────────────────────────────────────────
 
 export async function createPlan(args: {
   sessionId: string;
-  persona: string;
   prompt: string;
   intent?: string;
-  teamTarget?: string; // optional default target the model can use
+  platform?: string;
 }): Promise<Plan> {
   const prompt = (args.prompt ?? "").trim();
   if (!prompt) throw new Error("Prompt is required");
 
   const planId = nanoid();
+  const platform = args.platform ?? "wecom";
 
-  // Ask the LLM to output a strict JSON plan using only allowlisted tools.
+  // Build tool catalog — only show tools relevant to this platform
+  const toolCatalog = getToolCatalog(platform);
+
+  // Pick platform-specific send example (2 steps: lookup + send with DIRECT message)
+  const sendTool = platform === "imessage" ? "imessage.send" : platform === "sms" ? "sms.send" : "platform.send";
+  const contactTool = platform === "imessage" ? "contacts.apple" : "contacts.lookup";
+  const sendArgs = platform === "imessage"
+    ? `"handle":"{{vars.contact.handle}}","recipientName":"{{vars.contact.name}}","message":"THE_MESSAGE"`
+    : platform === "sms"
+    ? `"recipientPhone":"{{vars.contact.phone}}","recipientName":"{{vars.contact.name}}","message":"THE_MESSAGE"`
+    : `"recipientId":"{{vars.contact.id}}","recipientName":"{{vars.contact.name}}","platform":"${platform}","message":"THE_MESSAGE"`;
+  const contactArgs = platform === "imessage"
+    ? `"query":"PERSON_NAME"`
+    : `"query":"PERSON_NAME","platform":"${platform}"`;
+
   const plannerInstruction = `
-  Return ONLY valid JSON. No markdown.
+Return ONLY valid JSON. No markdown.
 
-  Allowed tools:
-  - llm.text: { "id": "s1", "tool": "llm.text", "prompt": "...", "saveAs": "name" }
-  - outbox.send: { "id": "s2", "tool": "outbox.send", "teamTarget": "#demo-team", "message": "..." }
+Produce a multi-step plan. Steps share data via "saveAs"/"{{vars.x.field}}".
 
-  Use {{prompt}} and {{vars.NAME}} templates.
+Tools:
+${toolCatalog}
 
-  Output schema:
-  { "intent": "string", "steps": [ ... ] }
+IMPORTANT rules:
+1. If the user gives a DIRECT message to send (e.g. "说明天吃什么"), put that text directly in the send tool's "message" arg. Do NOT use text.generate.
+2. Only use text.generate when the user asks to COMPOSE/WRITE something (e.g. "写一封邀请函", "帮我想一段祝福语").
+3. To send to a person, FIRST look up the contact, THEN send.
+4. Each step needs: id, tool, description (Chinese), args. saveAs must be a plain name like "contact".
 
-  User prompt:
-  ${prompt}
-  `.trim();
+Example A — direct message "给查理说明天开会":
+{"intent":"给查理发消息","steps":[{"id":"s1","tool":"${contactTool}","description":"查找查理","args":{${contactArgs.replace("PERSON_NAME", "查理")}},"saveAs":"contact"},{"id":"s2","tool":"${sendTool}","description":"发送消息","args":{${sendArgs.replace("THE_MESSAGE", "明天开会")}},"dependsOn":["s1"]}]}
 
+Example B — compose + send "帮我写个生日祝福发给查理":
+{"intent":"写生日祝福发给查理","steps":[{"id":"s1","tool":"text.generate","description":"生成祝福","args":{"prompt":"写一段简短的生日祝福语"},"saveAs":"msg"},{"id":"s2","tool":"${contactTool}","description":"查找查理","args":{${contactArgs.replace("PERSON_NAME", "查理")}},"saveAs":"contact"},{"id":"s3","tool":"${sendTool}","description":"发送消息","args":{${sendArgs.replace("THE_MESSAGE", "{{vars.msg.text}}")}},"dependsOn":["s1","s2"]}]}
 
-  console.log("[createPlan] calling ollama...");
+User: ${prompt}
+`.trim();
 
-  // Call the same text model to generate the plan JSON.
-  const draft = await planWithRepair({ persona: args.persona, plannerInstruction });
-  const { intent, steps } = validatePlanDraft(draft);
+  console.log("[createPlan] calling planner…");
 
+  const draft = await planWithRepair(plannerInstruction);
+  let { intent, steps, requiredPermissions } = validatePlanDraft(draft);
+
+  // Post-process: strip file.save steps the user didn't ask for
+  const wantsFile = /保存|存储|文件|save|file|导出|export/i.test(prompt);
+  if (!wantsFile) {
+    const before = steps.length;
+    steps = steps.filter((s) => s.tool !== "file.save");
+    if (steps.length < before) {
+      console.log(`[createPlan] stripped ${before - steps.length} unwanted file.save step(s)`);
+      // Recompute permissions
+      const permsSet = new Set<string>();
+      for (const s of steps) {
+        const t = getTool(s.tool);
+        if (t) for (const p of t.permissions) permsSet.add(p);
+      }
+      requiredPermissions = Array.from(permsSet);
+    }
+  }
 
   const plan: Plan = {
     planId,
     sessionId: args.sessionId,
     createdAt: Date.now(),
-    persona: args.persona,
     prompt,
     intent: args.intent ?? intent,
-    steps
+    steps,
+    requiredPermissions,
   };
 
   savePlan(planId, plan);
   return plan;
 }
-
-// Export template renderer so executor can use the same logic (optional)
-export { renderTemplate };

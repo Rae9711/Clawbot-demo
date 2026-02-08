@@ -1,14 +1,106 @@
+/**
+ * Plan execution — dispatches to registered tools.
+ *
+ * For each step:
+ *   1. Resolve {{vars.NAME}} and {{vars.NAME.field}} in args (mechanical string replacement)
+ *   2. Look up tool in registry
+ *   3. Run tool with resolved args (sandboxed with timeout)
+ *   4. Store output in vars[step.saveAs]
+ *   5. Record result in ExecutionSummary
+ *
+ * Tools that use LLM internally (text.generate, image.generate) are explicit,
+ * approved calls — not hidden "let me think again" detours.
+ *
+ * Failures are captured, not thrown. The Reporter acknowledges them.
+ */
+
 import { nanoid } from "nanoid";
 import { getPlan } from "../planStore.js";
 import { runSandboxed } from "../sandbox/sandboxRunner.js";
-import { sendToTeam } from "../sandbox/tools.js";
-import { saveRun, type RunRecord } from "./executeStore.js";
-import { textComplete } from "./ollama.js";
-import { renderTemplate, type Plan, type PlanStep } from "./plan.js";
+import {
+  saveRun,
+  type RunRecord,
+  type StepResult,
+  type ExecutionSummary,
+} from "./executeStore.js";
+import { getTool } from "./tools/registry.js";
+import type { Plan, PlanStep } from "./plan.js";
+
+// ── var resolution ───────────────────────────────────────
+
+/**
+ * Resolve {{vars.NAME}} and {{vars.NAME.field}} in a value.
+ * Works recursively on objects and arrays.
+ * This is mechanical string replacement — no LLM reasoning.
+ */
+function resolveVars(value: any, vars: Record<string, any>): any {
+  if (typeof value === "string") {
+    return value.replace(
+      /\{\{\s*vars\.([a-zA-Z0-9_]+)(?:\.([a-zA-Z0-9_]+))?\s*\}\}/g,
+      (_match, varName, field) => {
+        const v = vars[varName];
+        if (v === undefined) {
+          return `[missing: ${varName}]`;
+        }
+        
+        // Check if variable has an error (from failed tool execution)
+        // If found === false, it means the tool failed to find/create the resource
+        if (v && typeof v === "object") {
+          if (v.error || (v.found === false)) {
+            const errorMsg = v.error || "上一步执行失败（未找到资源）";
+            if (field) {
+              return `[error: ${varName}.${field} - ${errorMsg}]`;
+            }
+            return `[error: ${varName} - ${errorMsg}]`;
+          }
+        }
+        
+        if (field) {
+          // First check if this is a failed tool result (found === false)
+          if (v && typeof v === "object" && v.found === false) {
+            const errorMsg = v.error || "上一步执行失败（未找到资源）";
+            return `[error: ${varName}.${field} - ${errorMsg}]`;
+          }
+          
+          const f = typeof v === "object" && v !== null ? v[field] : undefined;
+          if (f === undefined || f === null) {
+            // Provide helpful error message
+            const availableFields = v && typeof v === "object" ? Object.keys(v).join(", ") : "无可用字段";
+            return `[missing: ${varName}.${field} (可用字段: ${availableFields})]`;
+          }
+          return String(f);
+        }
+        return typeof v === "object" ? JSON.stringify(v) : String(v);
+      },
+    );
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => resolveVars(item, vars));
+  }
+
+  if (value && typeof value === "object") {
+    const out: Record<string, any> = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = resolveVars(v, vars);
+    }
+    return out;
+  }
+
+  return value;
+}
+
+// ── timeout config per tool category ─────────────────────
+
+/** Tools that need long timeouts (LLM calls, AppleScript automation) */
+const SLOW_TOOLS = new Set(["text.generate", "image.generate", "contacts.apple", "imessage.send"]);
+const SLOW_TIMEOUT = 300_000;  // 5 minutes
+const FAST_TIMEOUT = 10_000;   // 10 seconds for local tools
+
+// ── executor ─────────────────────────────────────────────
 
 export async function executePlan(opts: {
   sessionId: string;
-  persona: string;
   planId: string;
   approved: boolean;
   emit: (event: string, data: any) => void;
@@ -20,102 +112,183 @@ export async function executePlan(opts: {
   const runId = nanoid();
   opts.emit("agent.exec.started", { runId, planId: plan.planId });
 
-  const vars: Record<string, string> = {};
-  let toolResult: any = null;
+  const stepResults: StepResult[] = [];
+  const toolResults: Record<string, any> = {};
+  const vars: Record<string, any> = {};
 
   for (let i = 0; i < plan.steps.length; i++) {
     const step: PlanStep = plan.steps[i];
     const stepId = step.id ?? `s${i + 1}`;
 
-    opts.emit("agent.exec.step", { runId, stepId, status: "running", tool: step.tool });
+    opts.emit("agent.exec.step", {
+      runId,
+      stepId,
+      status: "running",
+      tool: step.tool,
+      description: step.description,
+    });
 
-    if (step.tool === "llm.text") {
-      opts.emit("tool.start", {
-        runId,
-        tool: "tool.llmTextProcess",
-        args: { model: process.env.OLLAMA_MODEL ?? "qwen2.5:7b", saveAs: step.saveAs }
+    // Look up tool in registry
+    const tool = getTool(step.tool);
+    if (!tool) {
+      const error = `Tool not found in registry: ${step.tool}`;
+      stepResults.push({ stepId, tool: step.tool, status: "error", error });
+      opts.emit("agent.exec.step", { runId, stepId, status: "error", outputPreview: error });
+      continue;
+    }
+
+    opts.emit("tool.start", {
+      runId,
+      tool: step.tool,
+      toolName: tool.name,
+      args: step.args,
+    });
+
+    try {
+      // Resolve {{vars.*}} in args
+      console.log(`[execute] Step ${stepId} resolving vars, current vars:`, Object.keys(vars));
+      const resolvedArgs = resolveVars(step.args, vars);
+      console.log(`[execute] Step ${stepId} resolved args:`, JSON.stringify(resolvedArgs).substring(0, 300));
+
+      // Run tool with appropriate timeout
+      const timeout = SLOW_TOOLS.has(step.tool) ? SLOW_TIMEOUT : FAST_TIMEOUT;
+      const ctx = { outboxDir: opts.outboxDir, vars };
+
+      const result = await runSandboxed(
+        () => tool.execute(resolvedArgs, ctx),
+        { timeoutMs: timeout, label: step.tool },
+      );
+
+      // Check if tool returned an error (some tools return { found: false, error: ... } instead of throwing)
+      // If found === false, it means the tool failed to find/create the resource
+      const hasError = result && typeof result === "object" && (
+        (result as any).error !== undefined ||
+        (result as any).found === false
+      );
+
+      console.log(`[execute] Step ${stepId} error check:`, {
+        hasError,
+        hasErrorField: !!(result as any)?.error,
+        found: (result as any)?.found,
+        tool: step.tool,
+        resultKeys: result && typeof result === "object" ? Object.keys(result) : "not an object"
       });
 
-      try {
-        const renderedPrompt = renderTemplate(step.prompt, { prompt: plan.prompt, vars });
-
-        const out = await runSandboxed(
-          () => textComplete({ persona: opts.persona, prompt: renderedPrompt }),
-          { timeoutMs: 4500_000, label: "textComplete" }
-        );
-
-        vars[step.saveAs] = String(out).trim();
-
-        opts.emit("tool.success", {
-          runId,
-          tool: "tool.llmTextProcess",
-          resultPreview: vars[step.saveAs].slice(0, 200)
+      if (hasError) {
+        const errorMsg = (result as any).error || "工具执行失败";
+        stepResults.push({
+          stepId,
+          tool: step.tool,
+          status: "error",
+          error: errorMsg,
+          output: result,
         });
 
+        opts.emit("tool.error", { runId, tool: step.tool, toolName: tool.name, error: errorMsg });
         opts.emit("agent.exec.step", {
           runId,
           stepId,
-          status: "ok",
-          outputPreview: vars[step.saveAs].slice(0, 160) + "…"
+          status: "error",
+          outputPreview: errorMsg,
         });
-      } catch (e: any) {
-        const msg = e?.message || String(e);
-        opts.emit("tool.error", { runId, tool: "tool.llmTextProcess", error: msg });
-        opts.emit("agent.exec.step", { runId, stepId, status: "error", outputPreview: msg });
-        throw e;
+
+        // Still store the result (with error) so later steps can check it
+        if (step.saveAs) {
+          const saveKey = step.saveAs
+            .replace(/^\{\{\s*vars\.\s*/, "")
+            .replace(/\s*\}\}\s*$/, "")
+            .replace(/\..+$/, "");
+          vars[saveKey] = result;
+          console.log(`[execute] Saved error result to vars[${saveKey}]:`, JSON.stringify(result).substring(0, 200));
+        }
+
+        // Continue to next step (don't throw)
+        continue;
       }
 
-      continue;
-    }
+      // Store output for later steps
+      if (step.saveAs) {
+        // Sanitize saveAs — small models sometimes write "{{vars.foo}}" instead of "foo"
+        const saveKey = step.saveAs
+          .replace(/^\{\{\s*vars\.\s*/, "")
+          .replace(/\s*\}\}\s*$/, "")
+          .replace(/\..+$/, ""); // "{{vars.contact.name}}" → "contact"
+        vars[saveKey] = result;
+        console.log(`[execute] Saved result to vars[${saveKey}]:`, JSON.stringify(result).substring(0, 200));
+      } else {
+        console.log(`[execute] Step ${stepId} has no saveAs, result not saved`);
+      }
 
-    if (step.tool === "outbox.send") {
-      opts.emit("tool.start", {
+      toolResults[stepId] = result;
+      stepResults.push({ stepId, tool: step.tool, status: "ok", output: result });
+
+      // Build a preview string for the UI
+      const preview = buildPreview(result);
+      opts.emit("tool.success", { runId, tool: step.tool, toolName: tool.name, result });
+      opts.emit("agent.exec.step", {
         runId,
-        tool: "tool.sendToTeam",
-        args: { teamTarget: step.teamTarget ?? "#demo-team" }
+        stepId,
+        status: "ok",
+        outputPreview: preview,
+      });
+    } catch (e: any) {
+      const errorMsg = e?.message || String(e);
+      const isTimeout = errorMsg.includes("timeout");
+
+      stepResults.push({
+        stepId,
+        tool: step.tool,
+        status: isTimeout ? "timeout" : "error",
+        error: errorMsg,
       });
 
-      const message = renderTemplate(step.message, { prompt: plan.prompt, vars });
+      opts.emit("tool.error", { runId, tool: step.tool, toolName: tool.name, error: errorMsg });
+      opts.emit("agent.exec.step", {
+        runId,
+        stepId,
+        status: "error",
+        outputPreview: errorMsg,
+      });
 
-      toolResult = await runSandboxed(
-        () =>
-          sendToTeam({
-            outboxDir: opts.outboxDir,
-            teamTarget: step.teamTarget ?? "#demo-team",
-            prompt: plan.prompt,
-            summary: message
-          }),
-        { timeoutMs: 5_000, label: "sendToTeam" }
-      );
-
-      opts.emit("tool.success", { runId, tool: "tool.sendToTeam", result: toolResult });
-      opts.emit("agent.exec.step", { runId, stepId, status: "ok", outputPreview: message.slice(0, 160) + "…" });
-      continue;
+      // Don't throw — record failure and continue.
     }
-
-    // Should be impossible because plan validation rejects unknown tools,
-    // but keep a hard fail anyway.
-    throw new Error(`Unknown/blocked tool: ${(step as any).tool}`);
   }
 
-  // Choose a “final” output: prefer vars.final if exists, else last var, else prompt
-  const keys = Object.keys(vars);
-  const finalText =
-    vars["final"] ??
-    (keys.length ? vars[keys[keys.length - 1]] : plan.prompt);
+  // ── build execution summary ────────────────────────────
 
-  opts.emit("agent.exec.finished", { runId, status: "ok" });
+  const allOk = stepResults.every((s) => s.status === "ok");
+  const allFailed = stepResults.every((s) => s.status !== "ok");
+  const summaryStatus = allOk ? "ok" : allFailed ? "failed" : "partial";
+
+  const executionSummary: ExecutionSummary = {
+    runId,
+    planId: plan.planId,
+    status: summaryStatus,
+    steps: stepResults,
+  };
+
+  opts.emit("agent.exec.finished", { runId, status: summaryStatus });
 
   const record: RunRecord = {
     runId,
     planId: plan.planId,
-    teamTarget: (plan as any).teamTarget,
     prompt: plan.prompt,
-    summary: finalText,
-    toolResult,
-    vars
+    executionSummary,
+    toolResults,
   };
 
   saveRun(record);
   return record;
+}
+
+// ── helpers ──────────────────────────────────────────────
+
+function buildPreview(result: any): string {
+  if (!result) return "(empty)";
+  if (typeof result === "string") return result.slice(0, 160);
+  if (result.text) return String(result.text).slice(0, 160);
+  if (result.filePath) return `File: ${result.filePath}`;
+  if (result.sent) return `Sent to ${result.recipientName ?? "recipient"} (${result.platform ?? "?"})`;
+  if (result.name) return `Found: ${result.name}`;
+  return JSON.stringify(result).slice(0, 160);
 }

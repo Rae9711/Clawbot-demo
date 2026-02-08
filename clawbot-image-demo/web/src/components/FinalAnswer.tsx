@@ -2,9 +2,34 @@ import React from "react";
 
 export default function FinalAnswer({ message }: { message: string }) {
   return (
-    <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12, marginTop: 12 }}>
-      <div style={{ fontWeight: 700 }}>Final Response</div>
-      <pre style={{ whiteSpace: "pre-wrap", marginTop: 8 }}>{message || "Nothing rendered yet."}</pre>
+    <div
+      style={{
+        background: "white",
+        borderRadius: 12,
+        border: "1px solid #E5E7EB",
+        padding: 20,
+      }}
+    >
+      <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 12 }}>
+        AI 回复
+      </div>
+
+      {!message ? (
+        <div style={{ color: "#9CA3AF", fontSize: 13 }}>
+          执行完成后将显示回复。
+        </div>
+      ) : (
+        <div
+          style={{
+            whiteSpace: "pre-wrap",
+            fontSize: 14,
+            lineHeight: 1.7,
+            color: "#374151",
+          }}
+        >
+          {message}
+        </div>
+      )}
     </div>
   );
 }
