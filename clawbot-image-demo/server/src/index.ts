@@ -172,6 +172,7 @@ const wss = new WebSocketServer({ server });
 
 const CONNECTOR_TOOLS = new Set(["contacts.apple", "imessage.send"]);
 const CONNECTOR_TOKEN = process.env.CONNECTOR_TOKEN?.trim();
+const REQUIRE_CONNECTOR_FOR_APPLE = process.env.REQUIRE_CONNECTOR_FOR_APPLE !== "false";
 
 wss.on("connection", (ws) => {
   ws.on("message", async (raw) => {
@@ -286,8 +287,18 @@ wss.on("connection", (ws) => {
           outboxDir,
           executeTool: async ({ sessionId, step, args, timeoutMs, localExecute }) => {
             const connectorId = getConnectorId(sessionId);
-            if (!connectorId || !CONNECTOR_TOOLS.has(step.tool)) {
+
+            if (!CONNECTOR_TOOLS.has(step.tool)) {
               return localExecute();
+            }
+
+            if (!connectorId) {
+              if (!REQUIRE_CONNECTOR_FOR_APPLE) {
+                return localExecute();
+              }
+              return {
+                error: "当前会话未绑定本机 Connector。请先在页面中绑定 Connector ID 后再执行 Apple 通讯录/iMessage 操作。",
+              };
             }
 
             if (!hasConnector(connectorId)) {
