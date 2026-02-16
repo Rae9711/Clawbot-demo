@@ -48,6 +48,15 @@ function connect() {
       return;
     }
 
+    if (typeof msg?.id === "string" && typeof msg?.ok === "boolean") {
+      if (msg.ok) {
+        console.log("[connector] register ok:", msg.result?.connectorId ?? CONNECTOR_ID);
+      } else {
+        console.error("[connector] register failed:", msg.error ?? "unknown error");
+      }
+      return;
+    }
+
     if (msg?.type === "event" && msg?.event === "connector.replaced") {
       console.warn("[connector] replaced by another connection, closing current socket");
       try {

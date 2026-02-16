@@ -222,11 +222,13 @@ wss.on("connection", (ws) => {
         if (!connectorId) throw new Error("connectorId is required");
 
         if (CONNECTOR_TOKEN && msg.params.token !== CONNECTOR_TOKEN) {
+          console.warn(`[connector] register rejected (invalid token): ${connectorId}`);
           sendJSON(ws, { id: msg.id, ok: false, error: "Invalid connector token" });
           return;
         }
 
         registerConnector(connectorId, ws as any);
+        console.log(`[connector] register accepted: ${connectorId}`);
         sendJSON(ws, {
           id: msg.id,
           ok: true,
