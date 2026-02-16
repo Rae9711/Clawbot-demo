@@ -82,10 +82,18 @@ import path from "path";
 import fs from "fs";
 import { WebSocketServer } from "ws";
 import { runSandboxed } from "./sandbox/sandboxRunner.js";
-import { getSession, setPersona, setPrompt } from "./sessionStore.js";
+import { bindConnector, getConnectorId, getSession, setPersona, setPrompt } from "./sessionStore.js";
 import { createPlan } from "./agent/plan.js";
 import { executePlan } from "./agent/execute.js";
 import { renderFinal } from "./agent/render.js";
+import {
+  getConnectedConnectorIds,
+  hasConnector,
+  invokeConnectorTool,
+  registerConnector,
+  resolveConnectorResult,
+  unregisterConnectorBySocket,
+} from "./connectorHub.js";
 
 /**
  * 导入工具注册模块
@@ -149,15 +157,21 @@ const server = app.listen(PORT, () => {
 type WSMsg =
   | { id: string; method: "session.setPersona"; params: { sessionId: string; persona: string } }
   | { id: string; method: "session.setPrompt"; params: { sessionId: string; prompt: string } }
+  | { id: string; method: "session.bindConnector"; params: { sessionId: string; connectorId: string } }
   | { id: string; method: "agent.plan"; params: { sessionId: string; intent: string; prompt?: string; teamTarget?: string; platform?: string } }
   | { id: string; method: "agent.execute"; params: { sessionId: string; planId: string; approved: boolean } }
-  | { id: string; method: "agent.render"; params: { sessionId: string; runId: string; persona: string } };
+  | { id: string; method: "agent.render"; params: { sessionId: string; runId: string; persona: string } }
+  | { id: string; method: "connector.register"; params: { connectorId: string; token?: string } }
+  | { id: string; method: "connector.result"; params: { requestId: string; ok: boolean; result?: any; error?: string } };
 
 function sendJSON(ws: any, obj: any) {
   ws.send(JSON.stringify(obj));
 }
 
 const wss = new WebSocketServer({ server });
+
+const CONNECTOR_TOOLS = new Set(["contacts.apple", "imessage.send"]);
+const CONNECTOR_TOKEN = process.env.CONNECTOR_TOKEN?.trim();
 
 wss.on("connection", (ws) => {
   ws.on("message", async (raw) => {
@@ -181,6 +195,51 @@ wss.on("connection", (ws) => {
 
       if (msg.method === "session.setPrompt") {
         setPrompt(msg.params.sessionId, msg.params.prompt ?? "");
+        sendJSON(ws, { id: msg.id, ok: true });
+        return;
+      }
+
+      if (msg.method === "session.bindConnector") {
+        const sessionId = msg.params.sessionId;
+        const connectorId = (msg.params.connectorId ?? "").trim();
+        if (!connectorId) throw new Error("connectorId is required");
+
+        bindConnector(sessionId, connectorId);
+        sendJSON(ws, {
+          id: msg.id,
+          ok: true,
+          result: {
+            sessionId,
+            connectorId,
+            connected: hasConnector(connectorId),
+          },
+        });
+        return;
+      }
+
+      if (msg.method === "connector.register") {
+        const connectorId = (msg.params.connectorId ?? "").trim();
+        if (!connectorId) throw new Error("connectorId is required");
+
+        if (CONNECTOR_TOKEN && msg.params.token !== CONNECTOR_TOKEN) {
+          sendJSON(ws, { id: msg.id, ok: false, error: "Invalid connector token" });
+          return;
+        }
+
+        registerConnector(connectorId, ws as any);
+        sendJSON(ws, {
+          id: msg.id,
+          ok: true,
+          result: {
+            connectorId,
+            connectedConnectors: getConnectedConnectorIds(),
+          },
+        });
+        return;
+      }
+
+      if (msg.method === "connector.result") {
+        resolveConnectorResult(msg.params);
         sendJSON(ws, { id: msg.id, ok: true });
         return;
       }
@@ -223,6 +282,31 @@ wss.on("connection", (ws) => {
           approved: msg.params.approved,
           emit,
           outboxDir,
+          executeTool: async ({ sessionId, step, args, timeoutMs, localExecute }) => {
+            const connectorId = getConnectorId(sessionId);
+            if (!connectorId || !CONNECTOR_TOOLS.has(step.tool)) {
+              return localExecute();
+            }
+
+            if (!hasConnector(connectorId)) {
+              return {
+                error: `未连接本地 Connector（${connectorId}）。请在你的 Mac 上启动 Connector 后重试。`,
+              };
+            }
+
+            try {
+              return await invokeConnectorTool({
+                connectorId,
+                tool: step.tool,
+                args,
+                timeoutMs: timeoutMs + 15_000,
+              });
+            } catch (e: any) {
+              return {
+                error: `本地 Connector 执行失败: ${e?.message || String(e)}`,
+              };
+            }
+          },
         });
 
         // Reporter + optional Styler — the only post-execution LLM calls.
@@ -280,6 +364,10 @@ wss.on("connection", (ws) => {
   });
 
   sendJSON(ws, { type: "event", event: "gateway.ready", data: { ok: true } });
+
+  ws.on("close", () => {
+    unregisterConnectorBySocket(ws as any);
+  });
 });
 
 // write test

@@ -75,8 +75,19 @@ import {
   type StepResult,
   type ExecutionSummary,
 } from "./executeStore.js";
-import { getTool } from "./tools/registry.js";
+import { getTool, type ToolContext } from "./tools/registry.js";
 import type { Plan, PlanStep } from "./plan.js";
+
+type StepExecuteHookInput = {
+  sessionId: string;
+  step: PlanStep;
+  args: Record<string, any>;
+  timeoutMs: number;
+  ctx: ToolContext;
+  localExecute: () => Promise<any>;
+};
+
+type StepExecuteHook = (input: StepExecuteHookInput) => Promise<any>;
 
 // ── Variable Resolution (变量解析) ───────────────────────────────────────
 
@@ -250,6 +261,7 @@ export async function executePlan(opts: {
   approved: boolean;
   emit: (event: string, data: any) => void;
   outboxDir: string;
+  executeTool?: StepExecuteHook;
 }): Promise<RunRecord> {
   const plan = getPlan(opts.planId) as Plan;
   if (!opts.approved) throw new Error("Execution requires approval.");
@@ -299,10 +311,22 @@ export async function executePlan(opts: {
       const timeout = SLOW_TOOLS.has(step.tool) ? SLOW_TIMEOUT : FAST_TIMEOUT;
       const ctx = { outboxDir: opts.outboxDir, vars };
 
-      const result = await runSandboxed(
-        () => tool.execute(resolvedArgs, ctx),
-        { timeoutMs: timeout, label: step.tool },
-      );
+      const localExecute = () =>
+        runSandboxed(() => tool.execute(resolvedArgs, ctx), {
+          timeoutMs: timeout,
+          label: step.tool,
+        });
+
+      const result = opts.executeTool
+        ? await opts.executeTool({
+            sessionId: opts.sessionId,
+            step,
+            args: resolvedArgs,
+            timeoutMs: timeout,
+            ctx,
+            localExecute,
+          })
+        : await localExecute();
 
       /**
        * 错误检测逻辑

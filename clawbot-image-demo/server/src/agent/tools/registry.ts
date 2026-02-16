@@ -144,8 +144,8 @@ export function getToolCatalog(platform?: string): string {
 // ── permission labels (Chinese) ──────────────────────────
 
 const PERMISSION_LABELS: Record<ToolPermission, string> = {
-  "contacts.read": "读取联系人",
-  "platform.send": "发送消息",
+  "contacts.read": "读取本机联系人（需用户授权）",
+  "platform.send": "使用你的账号发送消息（需用户授权）",
   "files.write": "写入文件",
 };
 

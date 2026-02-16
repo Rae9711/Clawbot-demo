@@ -390,14 +390,22 @@ ${toolCatalog}
 IMPORTANT rules:
 1. If the user gives a DIRECT message to send (e.g. "说明天吃什么"), put that text directly in the send tool's "message" arg. Do NOT use text.generate.
 2. Only use text.generate when the user asks to COMPOSE/WRITE something (e.g. "写一封邀请函", "帮我想一段祝福语").
-3. To send to a person, FIRST look up the contact, THEN send.
-4. Each step needs: id, tool, description (Chinese), args. saveAs must be a plain name like "contact".
+3. If the user already provides a direct address (phone/email), send directly without contact lookup.
+4. If no direct address is provided, FIRST look up the contact, THEN send.
+5. Each step needs: id, tool, description (Chinese), args. saveAs must be a plain name like "contact".
 
 Example A — direct message "给查理说明天开会":
 {"intent":"给查理发消息","steps":[{"id":"s1","tool":"${contactTool}","description":"查找查理","args":{${contactArgs.replace("PERSON_NAME", "查理")}},"saveAs":"contact"},{"id":"s2","tool":"${sendTool}","description":"发送消息","args":{${sendArgs.replace("THE_MESSAGE", "明天开会")}},"dependsOn":["s1"]}]}
 
 Example B — compose + send "帮我写个生日祝福发给查理":
 {"intent":"写生日祝福发给查理","steps":[{"id":"s1","tool":"text.generate","description":"生成祝福","args":{"prompt":"写一段简短的生日祝福语"},"saveAs":"msg"},{"id":"s2","tool":"${contactTool}","description":"查找查理","args":{${contactArgs.replace("PERSON_NAME", "查理")}},"saveAs":"contact"},{"id":"s3","tool":"${sendTool}","description":"发送消息","args":{${sendArgs.replace("THE_MESSAGE", "{{vars.msg.text}}")}},"dependsOn":["s1","s2"]}]}
+
+Example C — direct address "给 ruiraywang97@gmail.com 发消息测试":
+${platform === "imessage"
+  ? '{"intent":"给指定地址发送消息","steps":[{"id":"s1","tool":"imessage.send","description":"直接发送 iMessage","args":{"handle":"ruiraywang97@gmail.com","recipientName":"ruiraywang97@gmail.com","message":"测试"}}]}'
+  : platform === "sms"
+  ? '{"intent":"给指定号码发送短信","steps":[{"id":"s1","tool":"sms.send","description":"直接发送短信","args":{"recipientPhone":"13800001111","recipientName":"13800001111","message":"测试"}}]}'
+  : '{"intent":"发送平台消息","steps":[{"id":"s1","tool":"platform.send","description":"发送平台消息","args":{"recipientId":"USER_ID","recipientName":"同事","platform":"wecom","message":"测试"}}]}'}
 
 User: ${prompt}
 `.trim();

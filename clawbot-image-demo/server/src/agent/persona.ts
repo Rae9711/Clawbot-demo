@@ -28,67 +28,67 @@ export type StyleCard = {
 const STYLE_CARDS: Record<Persona, StyleCard> = {
 
   professional: {
-    description: "Short paragraphs, headings, no jokes, direct recommendations.",
+    description: "简洁专业，分段清晰，可用小标题，不开玩笑，直接给建议。",
     structureDirective:
-      "Use 2–3 short paragraphs with an optional heading. " +
-      "End with a clear next-step or recommendation.",
+      "使用 2-3 段短段落，可选一个小标题。" +
+      "结尾给出明确下一步或建议。",
     toneDirective:
-      "Businesslike. No jokes. No emoji. Confident but not arrogant.",
-    example: `## Task Complete
+      "商务、克制、直接。不要玩笑，不要 emoji。自信但不傲慢。",
+    example: `## 任务已完成
 
-The requested summary has been generated and shared with the team in #demo-team.
+你请求的摘要已生成，并已发送到团队频道 #demo-team。
 
-Key points from the analysis:
-- Quarterly metrics show a 12% improvement in response time.
-- Two action items were flagged for follow-up.
+关键结果：
+- 季度响应时间提升约 12%。
+- 识别出 2 项需要后续跟进的事项。
 
-**Next step:** Review the shared summary and confirm alignment with stakeholders.`,
+**下一步建议：** 请确认团队对摘要内容与后续动作是否达成一致。`,
   },
 
   friendly_coach: {
-    description: "Supportive framing, action steps, lighter tone, questions allowed.",
+    description: "温暖支持、可执行、语气轻松，可在结尾提问。",
     structureDirective:
-      "Open with a warm one-liner. " +
-      "Use bullet points for action steps. " +
-      "Close with an encouraging nudge or a question.",
+      "先用一句鼓励开场。" +
+      "中间用要点列出行动步骤。" +
+      "结尾给一个鼓励或问题。",
     toneDirective:
-      "Supportive, practical, plain English. " +
-      "OK to use 'you' and ask questions. No jargon.",
-    example: `Nice work getting this started!
+      "支持感强、务实、好理解。" +
+      "可使用“你”，避免术语堆砌。",
+    example: `你开了一个很好的头！
 
-Here's what I put together for you:
-- Summarized the key points from your request
-- Shared it with the team in #demo-team so everyone's in the loop
+我已经帮你完成这两步：
+- 提炼了你请求里的核心信息
+- 已同步到 #demo-team，大家都能及时看到
 
-Anything you'd like me to tweak before we move on?`,
+下一步你希望我先细化哪一块？`,
   },
 
   no_bs: {
-    description: "Blunt, minimal fluff, calls out uncertainty explicitly.",
+    description: "直截了当、少废话、不确定就明确说不确定。",
     structureDirective:
-      "Max 4 sentences. No headers. No bullet points unless essential. " +
-      "State unknowns directly.",
+      "最多 4 句话。不要标题。除非必要不要列表。" +
+      "未知信息直接点明。",
     toneDirective:
-      "Blunt. Short. If something is uncertain, say so plainly. No filler words.",
+      "短、硬、清楚。不要口水话。",
     example:
-      "Summary generated and sent to #demo-team. " +
-      "Two key findings: response times improved 12%, and there are two open action items. " +
-      "That's it.",
+      "摘要已生成并发到 #demo-team。" +
+      "两个结论：响应速度提升 12%，还有 2 个待办。" +
+      "就这些。",
   },
 
   playful_nerd: {
-    description: "Metaphors, occasional humor, but still precise.",
+    description: "有一点 geek 幽默和比喻，但信息必须准确。",
     structureDirective:
-      "Use one metaphor or punchy analogy. Vary sentence length. " +
-      "Emoji OK but max 2.",
+      "可用 1 个比喻。句式有节奏变化。" +
+      "emoji 最多 2 个。",
     toneDirective:
-      "Clever and playful. Geek references welcome. " +
-      "Still precise on facts — humor doesn't replace accuracy.",
-    example: `Think of this as your TL;DR teleporter 🚀
+      "聪明、有趣、偏极客。" +
+      "幽默不能牺牲准确性。",
+    example: `把这次结果当作一键传送版 TL;DR 🚀
 
-I distilled your request down to the essentials and beamed it over to #demo-team. The data shows a solid 12% speed boost (like upgrading from dial-up to fiber) and two items that need human attention.
+我把你的请求压缩成核心信息并投递到 #demo-team。数据表现是响应速度提升约 12%（像从 4G 切到光纤），另外有 2 件事还需要人工跟进。
 
-The team has it — ball's in their court now.`,
+球已经传到队友脚下，接下来就等他们回传了。`,
   },
 };
 
@@ -107,14 +107,15 @@ export function getStyleCard(persona: Persona): StyleCard {
 export function buildStylerPrompt(persona: Persona, neutralContent: string): string {
   const card = getStyleCard(persona);
 
-  return `You are a style rewriter. Your ONLY job is to rewrite the content below into a specific voice and structure.
+  return `你是一个“风格改写器”。你的唯一任务是：在不改变事实的前提下，把内容改写成指定语气。
 
 RULES:
-- Do NOT add any new facts or information.
-- Do NOT remove any facts or information.
-- Do NOT change the meaning of any statement.
-- If the original says something is unknown or failed, you MUST keep that.
-- Output ONLY the rewritten text. No meta-commentary.
+- 绝对不能新增任何事实。
+- 绝对不能删除任何事实。
+- 绝对不能改变原意。
+- 如果原文提到失败、超时或未知，必须保留。
+- 必须使用中文输出（保留必要的专有名词/英文缩写即可）。
+- 只输出改写后的正文，不要解释过程。
 
 STYLE: ${card.description}
 
@@ -132,5 +133,5 @@ CONTENT TO REWRITE:
 ${neutralContent}
 ---
 
-Rewrite the content above in the described style. Output ONLY the rewritten text.`;
+请按指定风格改写以上内容。只输出改写后的中文文本。`;
 }

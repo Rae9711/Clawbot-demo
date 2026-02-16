@@ -10,6 +10,7 @@ type Session = {
   sessionId: string;
   persona: Persona;
   prompt?: string; // NEW: primary user input
+  connectorId?: string;
 };
 
 const sessions = new Map<string, Session>();
@@ -37,6 +38,15 @@ export function setPrompt(sessionId: string, prompt: string) {
 
 export function getPrompt(sessionId: string): string | undefined {
   return getSession(sessionId).prompt;
+}
+
+export function bindConnector(sessionId: string, connectorId: string) {
+  const s = getSession(sessionId);
+  s.connectorId = (connectorId || "").trim() || undefined;
+}
+
+export function getConnectorId(sessionId: string): string | undefined {
+  return getSession(sessionId).connectorId;
 }
 
 export function newSessionId() {

@@ -3,6 +3,18 @@ import { createWS, type EventMsg } from "./api/ws";
 import ProposedPlan from "./components/ProposedPlan";
 import ExecutionLog from "./components/ExecutionLog";
 import FinalAnswer from "./components/FinalAnswer";
+import AgentAvatarCard from "./components/AgentAvatarCard";
+import {
+  applyEvent,
+  equipCosmetic,
+  loadMeta,
+  saveMeta,
+  setCustomCosmeticAsset,
+  type AgentEventType,
+  type AgentMeta,
+  type AvatarState,
+  type CosmeticSlot,
+} from "./agentMeta";
 
 // Auto-detect WebSocket URL from current hostname if accessed via ngrok
 function getWebSocketURL(): string {
@@ -32,6 +44,10 @@ type AIIdentity = {
   platformTarget: string;
   createdAt: number;
 };
+
+function getDefaultConnectorId(identity: AIIdentity) {
+  return `${identity.name.toLowerCase().replace(/\s+/g, "-")}-mac`;
+}
 
 function loadIdentity(): AIIdentity | null {
   try {
@@ -313,6 +329,8 @@ export default function App() {
       onReset={() => {
         localStorage.removeItem("ai_identity");
         localStorage.removeItem("demo_session");
+        const keys = Object.keys(localStorage).filter((k) => k.startsWith("agent_meta_"));
+        keys.forEach((k) => localStorage.removeItem(k));
         setIdentity(null);
       }}
     />
@@ -329,6 +347,10 @@ function MainScreen({
   onReset: () => void;
 }) {
   const sessionId = useMemo(() => getSessionId(), []);
+  const metaStorageKey = useMemo(
+    () => `agent_meta_${sessionId}_${identity.createdAt}`,
+    [sessionId, identity.createdAt],
+  );
   const [prompt, setPrompt] = useState("");
   const [plan, setPlan] = useState<any>(null);
   const [planId, setPlanId] = useState<string | null>(null);
@@ -339,6 +361,79 @@ function MainScreen({
   const [wsClient, setWsClient] = useState<any>(null);
   const [connected, setConnected] = useState(false);
   const [approvedPermissions, setApprovedPermissions] = useState<Set<string>>(new Set());
+  const connectorStorageKey = useMemo(() => `connector_id_${sessionId}`, [sessionId]);
+  const [connectorId, setConnectorId] = useState<string>(() => {
+    const stored = localStorage.getItem(`connector_id_${getSessionId()}`);
+    return stored || getDefaultConnectorId(identity);
+  });
+  const [connectorOnline, setConnectorOnline] = useState(false);
+  const [manualAddress, setManualAddress] = useState("");
+  const [showManualAddressFallback, setShowManualAddressFallback] = useState(false);
+  const [manualFallbackReason, setManualFallbackReason] = useState("");
+  const [agentMeta, setAgentMeta] = useState<AgentMeta>(() => loadMeta(metaStorageKey));
+  const [avatarState, setAvatarState] = useState<AvatarState>("idle");
+  const [lastGainXp, setLastGainXp] = useState(0);
+  const [rewardedRunIds, setRewardedRunIds] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    setAgentMeta(loadMeta(metaStorageKey));
+  }, [metaStorageKey]);
+
+  const applyProgressEvent = (eventType: AgentEventType) => {
+    setAgentMeta((prev) => {
+      const result = applyEvent(prev, eventType);
+      if (result.gainedXp > 0) {
+        setLastGainXp(result.gainedXp);
+      }
+      saveMeta(metaStorageKey, result.next);
+      return result.next;
+    });
+  };
+
+  const handleSetColor = (color: string) => {
+    setAgentMeta((prev) => {
+      const next = { ...prev, color };
+      saveMeta(metaStorageKey, next);
+      return next;
+    });
+  };
+
+  const handleEquip = (slot: CosmeticSlot, cosmeticId: string) => {
+    setAgentMeta((prev) => {
+      const next = equipCosmetic(prev, slot, cosmeticId);
+      saveMeta(metaStorageKey, next);
+      return next;
+    });
+  };
+
+  const handleSetCustomAsset = (slot: CosmeticSlot, asset: string) => {
+    setAgentMeta((prev) => {
+      const next = setCustomCosmeticAsset(prev, slot, asset);
+      saveMeta(metaStorageKey, next);
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    if (!connected) {
+      setAvatarState("sleep");
+      return;
+    }
+    if (phase === "planning" || phase === "executing") {
+      setAvatarState("thinking");
+      return;
+    }
+    if (phase === "done") {
+      setAvatarState("success");
+      const timer = setTimeout(() => setAvatarState("idle"), 1500);
+      return () => clearTimeout(timer);
+    }
+    if (phase === "planned") {
+      setAvatarState("focused");
+      return;
+    }
+    setAvatarState("idle");
+  }, [phase, connected]);
 
   // ── WebSocket setup ──────────────────────────────────
   useEffect(() => {
@@ -354,10 +449,37 @@ function MainScreen({
           setPhase("planned");
         }
 
-        if (ev === "agent.plan.error") setPhase("idle");
+        if (ev === "agent.plan.error") {
+          setPhase("idle");
+          setAvatarState("error");
+          setTimeout(() => setAvatarState("idle"), 1200);
+        }
 
         if (ev.startsWith("agent.exec") || ev.startsWith("tool.")) {
           setLogs((prev) => [...prev, { ts: Date.now(), ev, data }]);
+        }
+
+        if (ev === "tool.start") {
+          setAvatarState("thinking");
+        }
+
+        if (ev === "tool.success") {
+          applyProgressEvent("tool_used");
+          setAvatarState("focused");
+        }
+
+        if (ev === "tool.error") {
+          const toolId = String(data?.tool ?? "");
+          const errorText = String(data?.error ?? "");
+          const shouldAskManualAddress =
+            toolId === "contacts.apple" ||
+            (toolId === "imessage.send" &&
+              /无法获取联系人信息|requires a handle|\[missing:|\[error:/i.test(errorText));
+
+          if (shouldAskManualAddress) {
+            setShowManualAddressFallback(true);
+            setManualFallbackReason(errorText || "联系人查找失败，请手动输入地址");
+          }
         }
 
         if (ev === "agent.exec.started") setPhase("executing");
@@ -365,10 +487,27 @@ function MainScreen({
         if (ev === "agent.rendered") {
           setFinalMsg(data.message);
           setPhase("done");
+          const thisRunId = data?.runId as string | undefined;
+          if (thisRunId) {
+            let shouldReward = false;
+            setRewardedRunIds((prev) => {
+              if (prev.has(thisRunId)) return prev;
+              shouldReward = true;
+              const next = new Set(prev);
+              next.add(thisRunId);
+              return next;
+            });
+            if (shouldReward) {
+              applyProgressEvent("task_completed");
+            }
+          }
         }
       } else {
         if (m.result?.planId) setPlanId(m.result.planId);
         if (m.result?.runId) setRunId(m.result.runId);
+        if (m.result?.connectorId) {
+          setConnectorOnline(!!m.result.connected);
+        }
       }
     });
 
@@ -384,23 +523,56 @@ function MainScreen({
     });
   }, [wsClient, sessionId, identity.persona]);
 
+  useEffect(() => {
+    localStorage.setItem(connectorStorageKey, connectorId);
+  }, [connectorStorageKey, connectorId]);
+
+  useEffect(() => {
+    if (!wsClient) return;
+    const id = connectorId.trim();
+    if (!id) return;
+
+    wsClient.call("session.bindConnector", {
+      sessionId,
+      connectorId: id,
+    });
+  }, [wsClient, sessionId, connectorId]);
+
   // ── Actions ──────────────────────────────────────────
-  const askPlan = () => {
-    if (!wsClient || !prompt.trim()) return;
+  const startPlanning = (nextPrompt: string) => {
+    if (!wsClient || !nextPrompt.trim()) return;
     setLogs([]);
     setFinalMsg("");
     setRunId(null);
     setPlanId(null);
     setPlan(null);
     setApprovedPermissions(new Set());
+    setShowManualAddressFallback(false);
+    setManualFallbackReason("");
     setPhase("planning");
+    setLastGainXp(0);
+
+    applyProgressEvent("streak_day");
+    applyProgressEvent("agent_message_sent");
 
     wsClient.call("agent.plan", {
       sessionId,
       intent: "process_text",
-      prompt,
+      prompt: nextPrompt,
       platform: identity.platform,
     });
+  };
+
+  const askPlan = () => {
+    startPlanning(prompt);
+  };
+
+  const retryWithManualAddress = () => {
+    const address = manualAddress.trim();
+    if (!address) return;
+    const mergedPrompt = `${prompt.trim()}\n收件人地址：${address}`;
+    setPrompt(mergedPrompt);
+    startPlanning(mergedPrompt);
   };
 
   const togglePermission = (perm: string) => {
@@ -589,6 +761,68 @@ function MainScreen({
                 }}
               />
 
+              <div style={{ marginTop: 10 }}>
+                <label
+                  style={{
+                    display: "block",
+                    fontWeight: 600,
+                    marginBottom: 6,
+                    fontSize: 12,
+                    color: "#6B7280",
+                  }}
+                >
+                  本机 Connector ID（用于调用你自己的 Mac 账号）
+                </label>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <input
+                    value={connectorId}
+                    onChange={(e) => {
+                      setConnectorOnline(false);
+                      setConnectorId(e.target.value);
+                    }}
+                    placeholder="例如：rae-mac"
+                    style={{
+                      flex: 1,
+                      padding: "8px 10px",
+                      borderRadius: 8,
+                      border: "1px solid #D1D5DB",
+                      fontSize: 13,
+                      outline: "none",
+                    }}
+                  />
+                  <button
+                    onClick={() => {
+                      if (!wsClient || !connectorId.trim()) return;
+                      wsClient.call("session.bindConnector", {
+                        sessionId,
+                        connectorId: connectorId.trim(),
+                      });
+                    }}
+                    style={{
+                      padding: "8px 12px",
+                      borderRadius: 8,
+                      border: "1px solid #E5E7EB",
+                      background: "white",
+                      fontSize: 12,
+                      cursor: "pointer",
+                    }}
+                  >
+                    绑定
+                  </button>
+                </div>
+                <div
+                  style={{
+                    marginTop: 6,
+                    fontSize: 12,
+                    color: connectorOnline ? "#059669" : "#9CA3AF",
+                  }}
+                >
+                  {connectorOnline
+                    ? `Connector 已在线：${connectorId}`
+                    : "Connector 未连接（Apple 通讯录/iMessage 将使用本机或报错）"}
+                </div>
+              </div>
+
               <div
                 style={{
                   display: "flex",
@@ -644,6 +878,70 @@ function MainScreen({
                   </button>
                 )}
               </div>
+
+              {showManualAddressFallback && (
+                <div
+                  style={{
+                    marginTop: 12,
+                    background: "#FEF3C7",
+                    borderRadius: 8,
+                    padding: 12,
+                  }}
+                >
+                  <div
+                    style={{
+                      fontSize: 12,
+                      fontWeight: 600,
+                      color: "#92400E",
+                      marginBottom: 6,
+                    }}
+                  >
+                    联系人读取失败，请先在本机授权；也可手动输入地址继续
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 12,
+                      color: "#78350F",
+                      marginBottom: 8,
+                      whiteSpace: "pre-wrap",
+                    }}
+                  >
+                    {manualFallbackReason}
+                  </div>
+
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <input
+                      value={manualAddress}
+                      onChange={(e) => setManualAddress(e.target.value)}
+                      placeholder="输入 iMessage 地址（手机号或邮箱）"
+                      style={{
+                        flex: 1,
+                        padding: "8px 10px",
+                        borderRadius: 8,
+                        border: "1px solid #D1D5DB",
+                        fontSize: 13,
+                        outline: "none",
+                      }}
+                    />
+                    <button
+                      onClick={retryWithManualAddress}
+                      disabled={!manualAddress.trim()}
+                      style={{
+                        padding: "8px 12px",
+                        borderRadius: 8,
+                        border: "none",
+                        background: manualAddress.trim() ? "#4F46E5" : "#D1D5DB",
+                        color: "white",
+                        fontSize: 13,
+                        fontWeight: 600,
+                        cursor: manualAddress.trim() ? "pointer" : "not-allowed",
+                      }}
+                    >
+                      用地址重试
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Plan card */}
@@ -656,6 +954,17 @@ function MainScreen({
 
           {/* ── Right: Execution + Response ─────────────── */}
           <div>
+            <AgentAvatarCard
+              agentName={identity.name}
+              meta={agentMeta}
+              state={avatarState}
+              lastGainXp={lastGainXp}
+              onSetColor={handleSetColor}
+              onEquip={handleEquip}
+              onSetCustomAsset={handleSetCustomAsset}
+              onPositiveFeedback={() => applyProgressEvent("user_feedback_positive")}
+              onShareResult={() => applyProgressEvent("shared_result")}
+            />
             <ExecutionLog logs={logs} />
             <FinalAnswer message={finalMsg} />
 

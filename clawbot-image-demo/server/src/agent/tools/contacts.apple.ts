@@ -9,7 +9,25 @@
  */
 
 import { execSync } from "child_process";
+import fs from "fs";
 import { registerTool, type ToolContext } from "./registry.js";
+
+function normalizeDirectHandle(input: string): string | null {
+  const q = input.trim();
+  if (!q) return null;
+
+  const emailLike = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(q);
+  if (emailLike) return q;
+
+  const digits = q.replace(/[^\d+]/g, "");
+  const onlyPhoneChars = /^[\d\s()+-]+$/.test(q);
+  const digitCount = digits.replace(/\+/g, "").length;
+  if (onlyPhoneChars && digitCount >= 7) {
+    return digits.startsWith("+") ? digits : digits;
+  }
+
+  return null;
+}
 
 // ── JXA script template ─────────────────────────────────
 
@@ -75,7 +93,47 @@ try {
 } catch (e) {
   JSON.stringify({ error: e.toString() });
 }
+
 `.trim();
+}
+
+function isRunningInContainer(): boolean {
+  if (process.env.CI === "true") return true;
+  if (fs.existsSync("/.dockerenv")) return true;
+  return false;
+}
+
+function preflightContactsAccess(): { ok: true } | { ok: false; error: string } {
+  if (process.platform !== "darwin") {
+    return {
+      ok: false,
+      error: "Apple 通讯录读取仅支持 macOS。",
+    };
+  }
+
+  if (isRunningInContainer()) {
+    return {
+      ok: false,
+      error:
+        "检测到当前在容器环境中运行，无法读取你本机通讯录。请在 macOS 本机直接运行 server（不要在 Docker 容器内），并用你的系统账户授权后再试。",
+    };
+  }
+
+  try {
+    execSync(`osascript -e 'id of application "Contacts"'`, {
+      timeout: 10_000,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    return {
+      ok: false,
+      error:
+        "未检测到 Contacts 应用。请确认在 macOS 本机运行，并确保系统通讯录可用。",
+    };
+  }
+
+  return { ok: true };
 }
 
 // ── tool registration ────────────────────────────────────
@@ -93,6 +151,30 @@ registerTool({
     const query = (args.query ?? "").trim();
     if (!query) throw new Error("contacts.apple requires a non-empty query");
 
+    const preflight = preflightContactsAccess();
+    if (!preflight.ok) {
+      return {
+        found: false,
+        name: query,
+        error: preflight.error,
+      };
+    }
+
+    const directHandle = normalizeDirectHandle(query);
+    if (directHandle) {
+      return {
+        found: true,
+        name: query,
+        phone: directHandle.includes("@") ? null : directHandle,
+        email: directHandle.includes("@") ? directHandle : null,
+        handle: directHandle,
+        allPhones: directHandle.includes("@") ? [] : [{ label: "direct", value: directHandle }],
+        allEmails: directHandle.includes("@") ? [{ label: "direct", value: directHandle }] : [],
+        matchCount: 1,
+        note: "输入是直接联系人地址，已跳过通讯录搜索",
+      };
+    }
+
     let raw: string;
     try {
       raw = execSync(`osascript -l JavaScript -e '${buildSearchScript(query)}'`, {
@@ -107,10 +189,10 @@ registerTool({
       
       // Provide helpful error messages
       let userFriendlyError = `无法访问 Apple 通讯录`;
-      if (errorOutput.includes("not allowed") || errorOutput.includes("denied")) {
-        userFriendlyError += ": 需要授予 Terminal/iTerm 访问通讯录的权限。请在 系统设置 > 隐私与安全性 > 通讯录 中允许。";
-      } else if (errorOutput.includes("not found") || errorOutput.includes("does not exist")) {
-        userFriendlyError += ": Contacts 应用未找到或未安装";
+      if (/not allowed|denied|not authorized|\(-1743\)|权限|未授权/i.test(errorOutput + " " + errorMsg)) {
+        userFriendlyError += ": 需要你本人在本机授权通讯录访问。请在 系统设置 > 隐私与安全性 > 通讯录 中允许 Terminal/iTerm/你的启动器。";
+      } else if (/(application|Application).*(not found|can't be found|does not exist)/.test(errorOutput)) {
+        userFriendlyError += ": Contacts 应用未找到（可能当前不是在 macOS 本机环境）";
       } else {
         userFriendlyError += `: ${errorMsg}`;
       }

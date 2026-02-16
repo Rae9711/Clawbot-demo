@@ -4,6 +4,8 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "connector": "tsx src/connector/index.ts",
+    "connector:dev": "tsx watch src/connector/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js"
   },

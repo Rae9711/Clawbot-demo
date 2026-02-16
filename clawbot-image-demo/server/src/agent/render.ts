@@ -28,7 +28,7 @@ function buildReporterPrompt(run: RunRecord): string {
     ...(s.error ? { error: s.error } : {}),
   }));
 
-  return `You are a factual reporter. Produce a clear, concise summary of what happened for the user.
+  return `你是事实汇报助手。请基于执行结果，向用户生成清晰、简洁的中文总结。
 
 USER'S ORIGINAL REQUEST:
 ${run.prompt}
@@ -44,8 +44,9 @@ RULES:
 - If information is missing from the execution log, say "I don't have that data from the execution log." Do NOT guess.
 - Be concise. State facts. No personality or style — that comes later.
 - Do NOT invent tool outputs or results that aren't in the execution log above.
+- 必须使用中文输出（必要的专有名词可保留英文）。
 
-Write a concise factual summary for the user.`;
+请输出面向用户的简洁事实总结。`;
 }
 
 // ── public API ───────────────────────────────────────────
@@ -65,20 +66,14 @@ export async function renderFinal(opts: {
     role: "reporter",
   });
 
-  // ── Call C: Styler (optional, persona rewrite) ───────
+  // ── Call C: Styler (always on, ensures selected persona + Chinese tone) ──
   let message: string;
-
-  if (persona === "professional") {
-    // Professional voice is close enough to neutral reporter — skip extra call
-    message = neutralContent;
-  } else {
-    console.log(`[render] styler call (${persona})…`);
-    const stylerPrompt = buildStylerPrompt(persona, neutralContent);
-    message = await textComplete({
-      prompt: stylerPrompt,
-      role: "styler",
-    });
-  }
+  console.log(`[render] styler call (${persona})…`);
+  const stylerPrompt = buildStylerPrompt(persona, neutralContent);
+  message = await textComplete({
+    prompt: stylerPrompt,
+    role: "styler",
+  });
 
   return { runId: run.runId, persona, message };
 }

@@ -1,0 +1,17 @@
+{
+  "version": "1.0.0",
+  "species": "cloud-robotic-core",
+  "forms": [
+    { "minLevel": 1, "name": "云核体", "shell": "/avatar-pack/evo-core-lv1.svg", "lottie": "/lottie/cloud-core-base.json" },
+    { "minLevel": 5, "name": "云核体·进阶", "shell": "/avatar-pack/evo-core-lv5.svg", "lottie": "/lottie/cloud-core-base.json" },
+    { "minLevel": 10, "name": "云核体·觉醒", "shell": "/avatar-pack/evo-core-lv10.svg", "lottie": "/lottie/cloud-core-base.json" }
+  ],
+  "states": {
+    "idle": { "segment": [0, 44] },
+    "focused": { "segment": [45, 89] },
+    "thinking": { "segment": [90, 134], "overlay": "/avatar-pack/state-thinking.svg" },
+    "success": { "segment": [135, 179], "overlay": "/avatar-pack/state-success.svg" },
+    "error": { "segment": [45, 89], "overlay": "/avatar-pack/state-error.svg" },
+    "sleep": { "segment": [0, 24], "overlay": "/avatar-pack/state-sleep.svg" }
+  }
+}

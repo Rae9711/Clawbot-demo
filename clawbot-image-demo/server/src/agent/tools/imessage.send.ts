@@ -17,6 +17,44 @@ import os from "os";
 import { nanoid } from "nanoid";
 import { registerTool, type ToolContext } from "./registry.js";
 
+function isRunningInContainer(): boolean {
+  if (process.env.CI === "true") return true;
+  if (fs.existsSync("/.dockerenv")) return true;
+  return false;
+}
+
+function preflightIMessageAccess(): { ok: true } | { ok: false; error: string } {
+  if (process.platform !== "darwin") {
+    return {
+      ok: false,
+      error: "iMessage 发送仅支持 macOS。",
+    };
+  }
+
+  if (isRunningInContainer()) {
+    return {
+      ok: false,
+      error:
+        "检测到当前在容器环境中运行，无法使用你本机 Messages 账号发送。请在 macOS 本机直接运行 server（不要在 Docker 容器内）后重试。",
+    };
+  }
+
+  try {
+    execSync(`osascript -e 'id of application "Messages"'`, {
+      timeout: 10_000,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    return {
+      ok: false,
+      error: "未检测到 Messages 应用，无法使用你的账号发送 iMessage。",
+    };
+  }
+
+  return { ok: true };
+}
+
 // ── AppleScript execution via temp file (avoids shell escaping) ──
 
 function runAppleScript(script: string): void {
@@ -46,6 +84,15 @@ end tell
 `.trim();
 }
 
+function buildServiceProbeScript(): string {
+  return `
+tell application "Messages"
+    set svcCount to count of (services whose service type = iMessage)
+    if svcCount is 0 then error "NO_IMESSAGE_SERVICE"
+end tell
+`.trim();
+}
+
 // ── tool registration ────────────────────────────────────
 
 registerTool({
@@ -69,6 +116,17 @@ registerTool({
     const message = (args.message ?? "").trim();
     if (!message) throw new Error("imessage.send requires a non-empty message");
 
+    const preflight = preflightIMessageAccess();
+    if (!preflight.ok) {
+      return {
+        sent: false,
+        messageId: nanoid(10),
+        handle: (args.handle ?? "").trim() || null,
+        recipientName: args.recipientName ?? null,
+        error: preflight.error,
+      };
+    }
+
     const handle = (args.handle ?? "").trim();
     if (!handle) throw new Error("imessage.send requires a handle (phone or email)");
     
@@ -86,9 +144,17 @@ registerTool({
     const script = buildSendScript(handle, message);
 
     try {
+      // Preflight: ensure iMessage service exists (Messages logged in)
+      runAppleScript(buildServiceProbeScript());
       runAppleScript(script);
     } catch (e: any) {
       const errMsg = e.message?.split("\n")[0] ?? "未知错误";
+      const errCombined = `${errMsg} ${(e.stderr?.toString() ?? "")}`;
+      const friendlyErr = errMsg.includes("NO_IMESSAGE_SERVICE")
+        ? "iMessage 服务不可用：请先打开 Messages，并确认已登录你自己的 iMessage 账号。"
+        : /not authorized|not permitted|\(-1743\)|denied|权限|未授权/i.test(errCombined)
+          ? "iMessage 发送失败：需要你本人在本机授权 Terminal/iTerm 控制 Messages。请在 系统设置 > 隐私与安全性 > 自动化 中允许。"
+          : `iMessage 发送失败: ${errMsg}`;
 
       // Save failed attempt to outbox for audit
       const ts = new Date().toISOString().replace(/[:.]/g, "-");
@@ -96,7 +162,7 @@ registerTool({
       fs.writeFileSync(
         failPath,
         JSON.stringify(
-          { messageId, handle, recipientName, message, error: errMsg, createdAt: new Date().toISOString() },
+          { messageId, handle, recipientName, message, error: friendlyErr, createdAt: new Date().toISOString() },
           null,
           2,
         ),
@@ -108,7 +174,7 @@ registerTool({
         messageId,
         handle,
         recipientName,
-        error: `iMessage 发送失败: ${errMsg}`,
+        error: friendlyErr,
         artifact: failPath,
       };
     }

@@ -68,8 +68,8 @@ const ROLE_CONFIG: Record<LLMRole, RoleConfig> = {
     temperature: 0.4, // creative enough for voice, constrained enough for safety
     num_predict: 512,
     systemPrompt:
-      "You are a style rewriter. Rewrite the content to match a given voice. " +
-      "Never add, remove, or change facts.",
+      "你是风格改写器。请按指定语气重写内容，并使用中文输出。" +
+      "绝对不要新增、删除或篡改事实。",
   },
   tool: {
     model: "qwen2.5:1.5b",
